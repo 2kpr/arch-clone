@@ -1,0 +1,484 @@
+#!/bin/bash
+
+# arch-clone by 2kpr
+# https://github.com/2kpr/arch-clone
+# based on refractasnapshot-10.4.2 (20250217) by fsmithred@gmail.com
+# License: GPL-3
+# This is free software with NO WARRANTY. Use at your own risk!
+
+version="1.0.0"
+
+help_text="Usage: $0 [option]
+
+Run with no options to create a bootable iso file for the
+currently running Arch install.
+
+Make sure to view and edit to your liking at least the 2
+included config files:
+ - settings.conf, which handles the basic config options/paths
+ - exclude.conf, which lists the files/folders excluded during
+   creation of the iso
+
+valid options:
+ -h, --help	show this help text
+ -v, --version	display the version information
+"
+
+while [[ $1 == -* ]]; do
+	case "$1" in
+		-h|--help)
+			printf "$help_text"
+			exit 0 ;;
+
+		-v|--version)
+			printf "$version\n"
+			exit 0 ;;
+
+		*)
+			printf "\t invalid option: $1 \n\n"
+			printf "\t Try: $0 -h for full help. \n\n"
+			exit 1 ;;
+	esac
+done
+
+# Check that user is root.
+[[ $(id -u) -eq 0 ]] || { echo -e "\n\t You need to be root!\n" ; exit 1 ; }
+
+current_directory=$(pwd)
+configfile="$current_directory/settings.conf"
+
+[[ -e "$configfile" ]] || { echo "Configuration file, $configfile  is missing." ; exit 1 ; }
+
+source "$configfile"
+
+snapshot_excludes="$current_directory/exclude.conf"
+grub_template="$current_directory/grub.cfg"
+splash_image="$current_directory/splash.png"
+
+echo "Config file: $configfile"
+echo "Excludes file: $snapshot_excludes"
+echo "Grub template file: $grub_template"
+echo "Splash image file: $splash_image"
+
+# Record errors in a logfile.
+exec 2>"$error_log"
+
+if [[ $DEBUG = "yes" ]]; then
+        set -x
+fi
+
+check_copies() {
+	# Function to check for old snapshots and filesystem copy and their total size
+	if [[ -d $snapshot_dir ]]; then
+		if ls "$snapshot_dir"/*.iso > /dev/null; then
+			snapshot_count=$(ls "$snapshot_dir"/*.iso | wc -l)
+		else
+			snapshot_count="0"
+		fi
+		snapshot_size=$(du -sh "$snapshot_dir" | awk '{print $1}')
+		if [[ -z $snapshot_size ]]; then
+			snapshot_size="0 bytes"
+		fi
+	else
+		snapshot_count="0"
+		snapshot_size="0 bytes"
+	fi
+
+	# Create a message to say whether the filesystem copy will be saved or not.
+	save_message=$(echo "* The temporary copy of the filesystem will be created
+at $work_dir/fs and removed when this program finishes.")
+}
+
+check_directories() {
+	# Create snapshot_dir and work_dir if necessary.
+	# Don't use /media/* for $snapshot_dir or $work_dir unless it is a mounted filesystem
+	snapdir_is_remote=$(echo ${snapshot_dir} | awk -F / '{ print "/" $2 "/" $3 }' | grep /media/)
+	workdir_is_remote=$(echo ${work_dir} | awk -F / '{ print "/" $2 "/" $3 }' | grep /media/)
+
+	if [ -n "$snapdir_is_remote" ] && cat /proc/mounts | grep -q ${snapdir_is_remote}; then
+		echo "$snapshot_dir is mounted"
+	elif [ -n "$snapdir_is_remote" ]; then
+		echo " Error.. The selected snapshot directory cannot be accessed. Do you need to mount it?"
+		exit 1
+	fi
+
+	if [ -n "$workdir_is_remote" ] && cat /proc/mounts | grep -q ${workdir_is_remote}; then
+		echo "$work_dir is mounted"
+	elif [ -n "$workdir_is_remote" ]; then
+		echo " Error.. The selected work directory cannot be accessed. Do you need to mount it?"
+		exit 1
+	fi
+
+	# Check that snapshot_dir exists
+	if ! [[ -d $snapshot_dir ]]; then
+		mkdir -p "$snapshot_dir"
+		chmod 777 "$snapshot_dir"
+	fi
+
+	# Check that work directories exist or create them.
+	if [[ -d $work_dir ]]; then
+		rm -rf "$work_dir"
+	fi
+	mkdir -p "$work_dir"/iso/arch/boot/x86_64
+	mkdir -p "$work_dir"/iso/arch/x86_64
+	mkdir -p "$work_dir"/fs
+	efi_work="${work_dir}/efi-files"
+}
+
+rebuild_initrd() {
+	if [[ ! -f /etc/mkinitcpio.conf ]]; then
+		echo "Error: /etc/mkinitcpio.conf is missing"
+		exit 1
+	fi
+
+	mkinitcpio_modules=$(sed -n 's/^MODULES=(\([^)]*\)).*$/\1/p' /etc/mkinitcpio.conf)
+	mkinitcpio_hooks=$(sed -n 's/^HOOKS=(\([^)]*\)).*$/\1/p' /etc/mkinitcpio.conf)
+
+	echo "$mkinitcpio_modules"
+	echo "$mkinitcpio_hooks"
+
+	if [[ -z "$mkinitcpio_modules" ]]; then
+		echo "Error: HOOKS in mkinitcpio is empty"
+		exit 1
+	fi
+
+	if [[ -z "$mkinitcpio_hooks" ]]; then
+		echo "Error: HOOKS in mkinitcpio is empty"
+		exit 1
+	fi
+
+	mkinitcpio_file="MODULES=(loop dm-snapshot isofs squashfs $mkinitcpio_modules)"$'\n'
+	mkinitcpio_file+="HOOKS=($(echo "$mkinitcpio_hooks" | sed -n 's/ block/ archiso archiso_loop_mnt block/p'))"$'\n'
+	mkinitcpio_file+="COMPRESSION=\"zstd\""$'\n'
+	mkinitcpio_file+="COMPRESSION_OPTIONS=(-15 -T0)"
+	echo "$mkinitcpio_file" > ${work_dir}/mkinitcpio.conf
+	mkinitcpio -c ${work_dir}/mkinitcpio.conf -g ${work_dir}/iso/arch/boot/x86_64/${initrd_image##*/}
+	#-k $(ls -1 /usr/lib/modules | head -n 1)
+}
+
+set_distro_name() {
+	DISTRO="Arch"
+
+	while true ; do
+		echo "This is the distribution name that will appear in the boot menu for the
+live image. You can change it to something else, or you can blank this,
+and the the menu entries will just say \"GNU/Linux <kernel-version>\""
+		# Redirect stderr from the error log to the screen,
+		# so we can see the prompts from read.
+		exec 2>&1
+		read -p "Enter, erase or change distro name: " -i "$DISTRO" -e answer
+		# Resume logging errors.
+		exec 2>>"$error_log"
+		break
+	done
+
+	if ! [[ -z "$answer" ]]; then
+		DISTRO="$answer"
+	fi
+}
+
+housekeeping() {
+	# Check that kernel and initrd exist
+	if [[ -e "$kernel_image" ]]; then
+		echo "Kernel image exists: $kernel_image"
+	else
+		kernel_message="Warning: kernel image is missing."
+	fi
+	if [[ -e "$initrd_image" ]]; then
+		echo "Initrd image exists: $initrd_image"
+	else
+		initrd_message="Warning: initrd image is missing."
+	fi
+	if [[ -n "$kernel_message" ]] || [[ -n "$initrd_message" ]]; then
+		echo "$kernel_message
+$initrd_message
+
+Make sure the kernel_image and/or initrd_image
+set in the config file are correct, and check
+that the boot menu is also correct.
+"
+		exit 1
+	fi
+}
+
+copy_kernelinitrd() {
+	cp "$kernel_image" "$work_dir"/iso/arch/boot/x86_64/
+	cp "$initrd_image" "$work_dir"/iso/arch/boot/x86_64/
+}
+
+copy_filesystem() {
+	rsync -avX / fs/ --exclude="$work_dir" --exclude="$snapshot_dir" --exclude="$efi_work" --exclude-from="$snapshot_excludes"
+}
+
+edit_system() {
+	# Truncate logs, remove archived logs.
+	find fs/var/log -name "*gz" -print0 | xargs -0r rm -f
+	find fs/var/log/ -type f -exec truncate -s 0 {} \;
+
+	# /etc/fstab should exist, even if it's empty,
+	# to prevent error messages at boot
+	touch "$work_dir"/fs/etc/fstab
+
+	# Blank out systemd machine id. If it does not exist, systemd-journald
+	# will fail, but if it exists and is empty, systemd will automatically
+	# set up a new unique ID.
+	if [ -e "$work_dir"/fs/etc/machine-id ]; then
+		rm -f "$work_dir"/fs/etc/machine-id
+		: > "$work_dir"/fs/etc/machine-id
+	fi
+
+	# add some basic files to /dev
+	mknod -m 622 "$work_dir"/fs/dev/console c 5 1
+	mknod -m 666 "$work_dir"/fs/dev/null c 1 3
+	mknod -m 666 "$work_dir"/fs/dev/zero c 1 5
+	mknod -m 666 "$work_dir"/fs/dev/ptmx c 5 2
+	mknod -m 666 "$work_dir"/fs/dev/tty c 5 0
+	mknod -m 444 "$work_dir"/fs/dev/random c 1 8
+	mknod -m 444 "$work_dir"/fs/dev/urandom c 1 9
+	chown -v root:tty "$work_dir"/fs/dev/{console,ptmx,tty}
+
+	ln -sv /proc/self/fd "$work_dir"/fs/dev/fd
+	ln -sv /proc/self/fd/0 "$work_dir"/fs/dev/stdin
+	ln -sv /proc/self/fd/1 "$work_dir"/fs/dev/stdout
+	ln -sv /proc/self/fd/2 "$work_dir"/fs/dev/stderr
+	ln -sv /proc/kcore "$work_dir"/fs/dev/core
+	mkdir -v "$work_dir"/fs/dev/shm
+	mkdir -v "$work_dir"/fs/dev/pts
+	chmod 1777 "$work_dir"/fs/dev/shm
+
+	# Clear configs from /etc/network/interfaces, wicd and NetworkManager
+	# connman and netman, so they aren't stealthily included in the snapshot.
+	echo "Clearing network configuration..."
+	echo "# The loopback network interface
+auto lo
+iface lo inet loopback" > "$work_dir"/fs/etc/network/interfaces
+	rm -f "$work_dir"/fs/var/lib/wicd/configurations/*
+	rm -f "$work_dir"/fs/etc/wicd/wireless-settings.conf
+	rm -f "$work_dir"/fs/etc/NetworkManager/system-connections/*
+	rm -f "$work_dir"/fs/etc/network/wifi/*
+	rm -rf "$work_dir"/fs/var/lib/connman/*
+}
+
+get_filename() {
+	snapshot_datetime=$(date +%Y%m%d_%H%M)
+	filename="$snapshot_basename"-"$snapshot_datetime".iso
+}
+
+mkefi() {
+	tempdir="$(mktemp -d /tmp/work_temp.XXXX)"
+	root_id="$snapshot_datetime".uuid
+
+	# for initial grub.cfg
+	mkdir -p "$tempdir"/boot/grub
+
+	cat >"$tempdir"/boot/grub/grub.cfg <<EOF
+search --file --set=root /boot/grub/$root_id
+set prefix=(\$root)/boot/grub
+source \$prefix/x86_64-efi/grub.cfg
+EOF
+
+	if ! [ -d "$efi_work" ]; then
+		mkdir "$efi_work"
+	fi
+
+	pushd "$efi_work"
+		# start with empty directories.
+		if [ -d "boot" ]; then
+			rm -rf boot
+		fi
+		if [ -d "efi" ]; then
+			rm -rf efi
+		fi
+		mkdir -p boot/grub/x86_64-efi
+		mkdir -p efi/boot
+
+		# create root id file in /boot/grub
+		: > boot/grub/$root_id
+
+		# copy splash
+		cp $splash_image boot/grub/splash.png
+
+		# second grub.cfg file
+		for i in $(ls /usr/lib/grub/x86_64-efi|grep part_|grep \.mod|sed 's/.mod//'); do echo "insmod $i" >> boot/grub/x86_64-efi/grub.cfg; done
+		# Additional modules so we don't boot in blind mode. I don't know which ones are really needed.
+		for i in efi_gop efi_uga ieee1275_fb vbe vga video_bochs video_cirrus jpeg png gfxterm ; do echo "insmod $i" >> boot/grub/x86_64-efi/grub.cfg ; done
+
+		echo "source /boot/grub/grub.cfg" >> boot/grub/x86_64-efi/grub.cfg
+
+		pushd "$tempdir"
+			# make a tarred "memdisk" to embed in the grub image
+			tar -cvf memdisk boot
+
+			# make the grub image
+			grub-mkimage -O "x86_64-efi" -m "memdisk" -o "bootx64.efi" -p '(memdisk)/boot/grub' search iso9660 configfile normal memdisk tar cat part_msdos part_gpt fat ext2 ntfs ntfscomp hfsplus chain boot linux
+		popd
+
+		# copy the grub image to efi/boot (to go later in the device's root)
+		cp "$tempdir"/bootx64.efi efi/boot
+
+		#######################
+		## Make the boot image "boot/grub/efiboot.img"
+		dd if=/dev/zero of=boot/grub/efiboot.img bs=1K count=1440
+		mkdosfs -F 12 boot/grub/efiboot.img
+		mkdir img-mnt
+		mount -o loop boot/grub/efiboot.img img-mnt
+		mkdir -p img-mnt/efi/boot
+		cp "$tempdir"/bootx64.efi img-mnt/efi/boot/
+		umount img-mnt
+		rm -rf img-mnt
+		#######################
+
+		# copy modules and font
+		cp /usr/lib/grub/x86_64-efi/* boot/grub/x86_64-efi/
+
+		# if this doesn't work try another font from the same place (grub's default, unicode.pf2, is much larger)
+		# Either of these will work, and they look the same to me. Unicode seems to work with qemu. -fsr
+		# cp /usr/share/grub/ascii.pf2 boot/grub/font.pf2
+		cp /usr/share/grub/unicode.pf2 boot/grub/font.pf2
+
+		# doesn't need to be root-owned
+		chown -R 1000:1000 $(pwd) 2>/dev/null
+
+		# Cleanup
+		rm -rf "$tempdir"
+	popd
+
+	# Copy files to iso
+	rsync -avx "$efi_work"/boot "$work_dir"/iso/
+	rsync -avx "$efi_work"/efi  "$work_dir"/iso/
+	cp "$grub_template" "$work_dir"/iso/boot/grub/grub.cfg
+}
+
+set_boot_options() {
+	[[ -n "$volid" ]] || volid="liveiso"
+	# Modify the boot menu.
+	sed -i "s:\${DISTRO}:$DISTRO:g" "$work_dir"/iso/boot/grub/grub.cfg
+	sed -i "s:\${kernel_image}:${kernel_image##*/}:g" "$work_dir"/iso/boot/grub/grub.cfg
+	sed -i "s:\${initrd_image}:${initrd_image##*/}:g" "$work_dir"/iso/boot/grub/grub.cfg
+	sed -i "s:\${volid}:$volid:g" "$work_dir"/iso/boot/grub/grub.cfg
+}
+
+edit_iso_files() {
+	if [[ $edit_iso_files = "yes" ]]; then
+		# Redirect stderr from the error log to the screen,
+		# so we can see the prompts from read.
+		exec 2>&1
+		echo
+		read -p "You may now edit any files in the $work_dir directory. When done hit ENTER to continue..."
+		# Resume logging errors.
+		exec 2>>"$error_log"
+	fi
+}
+
+squash_filesystem() {
+	echo "Squashing the filesystem..."
+	mksquashfs fs/ iso/arch/x86_64/airootfs.sfs ${mksq_comp} -noappend \
+	|| { echo -e "\n Error: mksquashfs failed. Exiting..."  ; exit 1 ; }
+
+	# This code is redundant, because $work_dir gets removed later, but
+	# it might help by making more space on the hard drive for the iso.
+	rm -rf fs
+}
+
+make_iso_fs() {
+	echo "Creating ISO: "$snapshot_dir"/"$filename""
+	[[ -n "$volid" ]] || volid="liveiso"
+	xorriso -as mkisofs -r -J -joliet-long -iso-level 3 -e boot/grub/efiboot.img -no-emul-boot \
+	-V "$volid" -o "$snapshot_dir"/"$filename" iso/
+	sync
+	echo "ISO created, finished..."
+}
+
+cleanup() {
+	echo "Cleaning..."
+	rm -rf "$work_dir"
+}
+
+check_dependencies() {
+	grub_installed="true"
+	dosfstools_installed="true"
+	echo "Checking for required packages: grub, dosfstools, mkinitcpio-archiso, squashfs-tools, xorriso, rsync, pv..."
+	if sudo pacman -Q grub &>/dev/null; then
+		echo "The grub package is installed"
+	else
+		echo "The grub package is not installed, installing..."
+		pacman -Syu grub --noconfirm
+	fi
+	if sudo pacman -Q dosfstools &>/dev/null; then
+		echo "The dosfstools package is installed"
+	else
+		echo "The dosfstools package is not installed, installing..."
+		pacman -Syu dosfstools --noconfirm
+	fi
+	if sudo pacman -Q mkinitcpio-archiso &>/dev/null; then
+		echo "The mkinitcpio-archiso package is installed"
+	else
+		echo "The mkinitcpio-archiso package is not installed, installing..."
+		pacman -Syu mkinitcpio-archiso --noconfirm
+	fi
+	if sudo pacman -Q squashfs-tools &>/dev/null; then
+		echo "The squashfs-tools package is installed"
+	else
+		echo "The squashfs-tools package is not installed, installing..."
+		pacman -Syu squashfs-tools --noconfirm
+	fi
+	if sudo pacman -Q xorriso &>/dev/null; then
+		echo "The xorriso package is installed"
+	else
+		echo "The xorriso package is not installed, installing..."
+		pacman -Syu xorriso --noconfirm
+	fi
+	if sudo pacman -Q rsync &>/dev/null; then
+		echo "The rsync package is installed"
+	else
+		echo "The rsync package is not installed, installing..."
+		pacman -Syu rsync --noconfirm
+	fi
+	if sudo pacman -Q pv &>/dev/null; then
+		echo "The pv package is installed"
+	else
+		echo "The pv package is not installed, installing..."
+		pacman -Syu pv --noconfirm
+	fi
+}
+
+choose_task() {
+	while true; do
+		echo "Choose a task.
+
+1. Create a snapshot (uefi enabled)
+2. Exit"
+		read ans
+		case $ans in
+		1) # Create snapshot
+			echo "This may take a moment while the program checks for free space.    "
+			check_copies
+			check_directories
+			set_distro_name
+			housekeeping
+			cd "$work_dir"
+			copy_kernelinitrd
+			copy_filesystem
+			rebuild_initrd
+			edit_system
+			get_filename
+			mkefi
+			set_boot_options
+			if [[ $edit_iso_files = "yes" ]]; then
+				edit_iso_files
+			fi
+			squash_filesystem
+			make_iso_fs
+			cleanup
+			echo -e "\n\tAll finished!\n"
+			exit 0 ;;
+		[2qQxX]) exit 0 ;;
+
+		esac
+	done
+}
+
+check_dependencies
+choose_task
+
+
