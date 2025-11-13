@@ -148,7 +148,7 @@ rebuild_initrd() {
 	fi
 
 	mkinitcpio_file="MODULES=(loop dm-snapshot isofs squashfs $mkinitcpio_modules)"$'\n'
-	mkinitcpio_file+="HOOKS=($(echo "$mkinitcpio_hooks" | sed -n 's/ block/ archiso archiso_loop_mnt block/p'))"$'\n'
+	mkinitcpio_file+="HOOKS=($(echo "$mkinitcpio_hooks" | sed -n 's/ block/ archiso archiso_loop_mnt block/p' | sed -n 's/ systemd/ udev/p'))"$'\n'
 	mkinitcpio_file+="COMPRESSION=\"zstd\""$'\n'
 	mkinitcpio_file+="COMPRESSION_OPTIONS=(-15 -T0)"
 	echo "$mkinitcpio_file" > ${work_dir}/mkinitcpio.conf
