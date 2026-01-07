@@ -134,14 +134,6 @@ rebuild_initrd() {
 	mkinitcpio_modules=$(sed -n 's/^MODULES=(\([^)]*\)).*$/\1/p' /etc/mkinitcpio.conf)
 	mkinitcpio_hooks=$(sed -n 's/^HOOKS=(\([^)]*\)).*$/\1/p' /etc/mkinitcpio.conf)
 
-	echo "$mkinitcpio_modules"
-	echo "$mkinitcpio_hooks"
-
-	if [[ -z "$mkinitcpio_modules" ]]; then
-		echo "Error: HOOKS in mkinitcpio is empty"
-		exit 1
-	fi
-
 	if [[ -z "$mkinitcpio_hooks" ]]; then
 		echo "Error: HOOKS in mkinitcpio is empty"
 		exit 1
